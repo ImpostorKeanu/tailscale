@@ -8,14 +8,22 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"sync"
 
 	"golang.org/x/crypto/acme/autocert"
 )
 
 var unsafeHostnameCharacters = regexp.MustCompile(`[^a-zA-Z0-9-\.]`)
+
+const (
+	crtSuffix = ".crt"
+	keySuffix = ".key"
+)
 
 type certProvider interface {
 	// TLSConfig creates a new TLS config suitable for net/http.Server servers.
@@ -53,18 +61,67 @@ func certProviderByCertMode(mode, dir, hostname string) (certProvider, error) {
 }
 
 type manualCertManager struct {
-	cert     *tls.Certificate
-	hostname string
+	cert           *tls.Certificate
+	certdir        string
+	hostname       string
+	filesChanged   bool
+	filesChangedMu sync.RWMutex
+	certMu         sync.RWMutex
 }
 
 // NewManualCertManager returns a cert provider which read certificate by given hostname on create.
 func NewManualCertManager(certdir, hostname string) (certProvider, error) {
-	keyname := unsafeHostnameCharacters.ReplaceAllString(hostname, "")
-	crtPath := filepath.Join(certdir, keyname+".crt")
-	keyPath := filepath.Join(certdir, keyname+".key")
+	cert, err := loadCertificate(certdir, hostname)
+	mgr := &manualCertManager{
+		cert:     cert,
+		certdir:  certdir,
+		hostname: hostname,
+	}
+	// Start a thread to monitor for changes to the certificate
+	// and key files.
+	watcherErrChan := make(chan error)
+	go func() {
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			watcherErrChan <- err
+		}
+		watcherErrChan <- watcher.Add(certdir)
+
+		for {
+			select {
+			case event := <-watcher.Events:
+				_, f := filepath.Split(event.Name)
+				if strings.HasSuffix(f, crtSuffix) || strings.HasSuffix(f, keySuffix) {
+					mgr.filesChangedMu.Lock()
+					if mgr.filesChanged == false {
+						mgr.filesChanged = true
+					}
+					mgr.filesChangedMu.Unlock()
+				}
+			case err = <-watcher.Errors:
+				fmt.Printf("fsnotify watcher error while monitoring certificates: %v", err)
+			}
+		}
+	}()
+
+	err = <-watcherErrChan
+	if err != nil {
+		return nil, fmt.Errorf("failed to start fsnotify watcher")
+	}
+
+	return mgr, err
+}
+
+func loadCertificate(certdir, hostname string) (*tls.Certificate, error) {
+	baseFN := unsafeHostnameCharacters.ReplaceAllString(hostname, "")
+	crtPath := filepath.Join(certdir, baseFN+crtSuffix)
+	keyPath := filepath.Join(certdir, baseFN+keySuffix)
+
+	fmt.Printf("derper loading key pair: %s, %s", crtPath, keyPath)
+
 	cert, err := tls.LoadX509KeyPair(crtPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("can not load x509 key pair for hostname %q: %w", keyname, err)
+		return nil, fmt.Errorf("can not load x509 key pair for hostname %q: %w", baseFN, err)
 	}
 	// ensure hostname matches with the certificate
 	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
@@ -74,7 +131,15 @@ func NewManualCertManager(certdir, hostname string) (certProvider, error) {
 	if err := x509Cert.VerifyHostname(hostname); err != nil {
 		return nil, fmt.Errorf("cert invalid for hostname %q: %w", hostname, err)
 	}
-	return &manualCertManager{cert: &cert, hostname: hostname}, nil
+	return &cert, nil
+}
+
+// shouldReload checks filesChanged to determine if the certificate
+// should be reloaded from disk.
+func (m *manualCertManager) shouldReload() bool {
+	m.filesChangedMu.RLock()
+	defer m.filesChangedMu.RUnlock()
+	return m.filesChanged
 }
 
 func (m *manualCertManager) TLSConfig() *tls.Config {
@@ -95,8 +160,32 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 	// Return a shallow copy of the cert so the caller can append to its
 	// Certificate field.
 	certCopy := new(tls.Certificate)
-	*certCopy = *m.cert
-	certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
+	copyCert := func() {
+		*certCopy = *m.cert
+		certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
+	}
+
+	if m.shouldReload() {
+
+		// Reload the certificate before copying it
+		cert, err := loadCertificate(m.certdir, m.hostname)
+		if err != nil {
+			fmt.Printf("derper had error while reloading certificate: %v", err)
+			return nil, nil
+		}
+		m.certMu.Lock()
+		m.cert = cert
+		copyCert()
+		m.certMu.Unlock()
+
+	} else {
+
+		m.certMu.RLock()
+		copyCert()
+		m.certMu.Unlock()
+
+	}
+
 	return certCopy, nil
 }
 
