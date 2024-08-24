@@ -51,11 +51,11 @@ import (
 var (
 	dev         = flag.Bool("dev", false, "run in localhost development mode (overrides -a)")
 	versionFlag = flag.Bool("version", false, "print version and exit")
-	addr        = flag.String("a", ":443", "server HTTP/HTTPS listen address, in form \":port\", \"ip:port\", or for IPv6 \"[ip]:port\". If the IP is omitted, it defaults to all interfaces. Serves HTTPS when -certmode is letsencrypt or manual, otherwise HTTP.")
+	addr        = flag.String("a", ":443", "server HTTP/HTTPS listen address, in form \":port\", \"ip:port\", or for IPv6 \"[ip]:port\". If the IP is omitted, it defaults to all interfaces. Serves HTTPS if the port is 443 and/or -certmode is manual, otherwise HTTP.")
 	httpPort    = flag.Int("http-port", 80, "The port on which to serve HTTP. Set to -1 to disable. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	stunPort    = flag.Int("stun-port", 3478, "The UDP port on which to serve STUN. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	configPath  = flag.String("c", "", "config file path")
-	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt, disable")
+	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt")
 	certDir     = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
 	hostname    = flag.String("hostname", "derp.tailscale.com", "LetsEncrypt host name, if addr's port is :443")
 	runSTUN     = flag.Bool("stun", true, "whether to run a STUN server. It will bind to the same IP (if any) as the --addr flag value.")
@@ -165,6 +165,8 @@ func main() {
 	}
 
 	cfg := loadConfig()
+
+	serveTLS := tsweb.IsProd443(*addr) || *certMode == "manual"
 
 	s := derp.NewServer(cfg.PrivateKey, log.Printf)
 	s.SetVerifyClient(*verifyClients)
@@ -293,15 +295,7 @@ func main() {
 		httpsrv.Shutdown(ctx)
 	}()
 
-	if *certMode == "disable" {
-		log.Printf("derper: serving on %s (TLS disabled)", *addr)
-		var ln net.Listener
-		ln, err = lc.Listen(context.Background(), "tcp", httpsrv.Addr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		err = httpsrv.Serve(ln)
-	} else {
+	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
 		var certManager certProvider
 		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname)
@@ -370,6 +364,14 @@ func main() {
 			}()
 		}
 		err = rateLimitedListenAndServeTLS(httpsrv, &lc)
+	} else {
+		log.Printf("derper: serving on %s", *addr)
+		var ln net.Listener
+		ln, err = lc.Listen(context.Background(), "tcp", httpsrv.Addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = httpsrv.Serve(ln)
 	}
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("derper: %v", err)
