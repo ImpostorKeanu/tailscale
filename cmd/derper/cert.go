@@ -72,41 +72,51 @@ type manualCertManager struct {
 // NewManualCertManager returns a cert provider which read certificate by given hostname on create.
 func NewManualCertManager(certdir, hostname string) (certProvider, error) {
 	cert, err := loadCertificate(certdir, hostname)
+	if err != nil {
+		return nil, err
+	}
+
 	mgr := &manualCertManager{
 		cert:     cert,
 		certdir:  certdir,
 		hostname: hostname,
 	}
-	// Start a thread to monitor for changes to the certificate
+
+	// Start a routine to monitor for changes to the certificate
 	// and key files.
-	watcherErrChan := make(chan error)
+	initChan := make(chan error, 1)
 	go func() {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
-			watcherErrChan <- err
-		}
-		watcherErrChan <- watcher.Add(certdir)
-
-		for {
-			select {
-			case event := <-watcher.Events:
-				_, f := filepath.Split(event.Name)
-				if strings.HasSuffix(f, crtSuffix) || strings.HasSuffix(f, keySuffix) {
-					mgr.filesChangedMu.Lock()
-					if mgr.filesChanged == false {
-						mgr.filesChanged = true
+			initChan <- err
+		} else if err := watcher.Add(certdir); err != nil {
+			initChan <- err
+		} else {
+			initChan <- nil
+			for {
+				select {
+				case event := <-watcher.Events:
+					if event.Op&fsnotify.Write == fsnotify.Write {
+						_, f := filepath.Split(event.Name)
+						if strings.HasSuffix(f, crtSuffix) || strings.HasSuffix(f, keySuffix) {
+							mgr.filesChangedMu.Lock()
+							if mgr.filesChanged == false {
+								mgr.filesChanged = true
+							}
+							mgr.filesChangedMu.Unlock()
+						}
 					}
-					mgr.filesChangedMu.Unlock()
+				case err = <-watcher.Errors:
+					fmt.Printf("fsnotify watcher error while monitoring certificate: %v", err)
 				}
-			case err = <-watcher.Errors:
-				fmt.Printf("fsnotify watcher error while monitoring certificates: %v", err)
 			}
 		}
 	}()
 
-	err = <-watcherErrChan
-	if err != nil {
-		return nil, fmt.Errorf("failed to start fsnotify watcher")
+	// Wait for fsnotify.Watcher to initialize
+	if err = <-initChan; err != nil {
+		mgr = nil
+		err = fmt.Errorf("failed to start fsnotify watcher: %v", err)
 	}
 
 	return mgr, err
@@ -166,24 +176,24 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 	}
 
 	if m.shouldReload() {
-
-		// Reload the certificate before copying it
 		cert, err := loadCertificate(m.certdir, m.hostname)
 		if err != nil {
+			// Log and use last known good certificate
 			fmt.Printf("derper had error while reloading certificate: %v", err)
-			return nil, nil
+		} else if cert != nil {
+			// Use latest certificate
+			m.certMu.Lock()
+			m.cert = cert
+			copyCert()
+			m.filesChanged = false
+			m.certMu.Unlock()
 		}
-		m.certMu.Lock()
-		m.cert = cert
-		copyCert()
-		m.certMu.Unlock()
+	}
 
-	} else {
-
+	if certCopy == nil {
 		m.certMu.RLock()
 		copyCert()
 		m.certMu.Unlock()
-
 	}
 
 	return certCopy, nil
