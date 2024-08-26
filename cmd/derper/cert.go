@@ -107,7 +107,7 @@ func NewManualCertManager(certdir, hostname string) (certProvider, error) {
 						}
 					}
 				case err = <-watcher.Errors:
-					fmt.Printf("fsnotify watcher error while monitoring certificate: %v", err)
+					fmt.Printf("fsnotify watcher error while monitoring certificate: %v\n", err)
 				}
 			}
 		}
@@ -127,7 +127,7 @@ func loadCertificate(certdir, hostname string) (*tls.Certificate, error) {
 	crtPath := filepath.Join(certdir, baseFN+crtSuffix)
 	keyPath := filepath.Join(certdir, baseFN+keySuffix)
 
-	fmt.Printf("derper loading key pair: %s, %s", crtPath, keyPath)
+	fmt.Printf("derper loading key pair: %s, %s\n", crtPath, keyPath)
 
 	cert, err := tls.LoadX509KeyPair(crtPath, keyPath)
 	if err != nil {
@@ -169,8 +169,9 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 
 	// Return a shallow copy of the cert so the caller can append to its
 	// Certificate field.
-	certCopy := new(tls.Certificate)
+	var certCopy *tls.Certificate
 	copyCert := func() {
+		certCopy = new(tls.Certificate)
 		*certCopy = *m.cert
 		certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
 	}
@@ -179,9 +180,10 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 		cert, err := loadCertificate(m.certdir, m.hostname)
 		if err != nil {
 			// Log and use last known good certificate
-			fmt.Printf("derper had error while reloading certificate: %v", err)
+			fmt.Printf("derper had error while reloading certificate: %v\n", err)
 		} else if cert != nil {
 			// Use latest certificate
+			fmt.Printf("derper is reloading certificate after change\n")
 			m.certMu.Lock()
 			m.cert = cert
 			copyCert()
@@ -193,7 +195,7 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 	if certCopy == nil {
 		m.certMu.RLock()
 		copyCert()
-		m.certMu.Unlock()
+		m.certMu.RUnlock()
 	}
 
 	return certCopy, nil
